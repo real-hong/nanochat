@@ -231,11 +231,15 @@ So far, the `--total-batch-size` was hardcoded to be `2**19 = 524,288` ~= 0.5M t
 Added `--total-batch-size=-1` (now the default) to auto-compute optimal batch:
 
 ```python
-get_scaling_params = lambda m: m.num_scaling_params()['transformer_matrices'] + m.num_scaling_params()['lm_head']
+get_scaling_params = lambda m: (
+    m.num_scaling_params()["transformer_matrices"] + m.num_scaling_params()["lm_head"]
+)
 if args.total_batch_size == -1:
     D_REF = args.target_param_data_ratio * get_scaling_params(build_model_meta(12))
     B_REF = 2**19
-    args.total_batch_size = 2 ** round(math.log2(B_REF * (target_tokens / D_REF) ** 0.383))
+    args.total_batch_size = 2 ** round(
+        math.log2(B_REF * (target_tokens / D_REF) ** 0.383)
+    )
 ```
 
 Reference point: d=12 model with B=2^19 (empirically validated). The reference is computed dynamically so that if the architecture changes (e.g., different `--aspect-ratio`), the math automatically adjusts. However, if the model actually does change too much, one would also want to re-tune the optimal batch size for d=12.
@@ -278,7 +282,7 @@ Replaced ReLU² MLP activation with SwiGLU (inspired by [twitter](https://x.com/
 # Old ReLU²: 2 matrices, 4x expansion
 #   params: 2 × n × 4n = 8n²
 #   flops:  2 × 2n × 4n = 16n² per token
-self.c_fc   = Linear(n_embd, 4 * n_embd)
+self.c_fc = Linear(n_embd, 4 * n_embd)
 self.c_proj = Linear(4 * n_embd, n_embd)
 x = c_proj(relu(c_fc(x)).square())
 
@@ -328,6 +332,7 @@ FP8 (8-bit floating point) uses H100's FP8 tensor cores for ~2x theoretical matm
 
 ```python
 from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+
 config = Float8LinearConfig.from_recipe_name("tensorwise")
 convert_to_float8_training(model, config=config)
 ```

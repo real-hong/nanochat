@@ -67,3 +67,19 @@ conflicts = [
         { extra = "gpu" },
     ],
 ]
+
+[tool.ruff.lint]
+ignore = [
+    "C408",    # dict(a=..., b=...) is the house style for optimizer param groups and configs
+    "RUF059",  # unpacked-but-unused shapes like `B, T, C = x.size()` document tensor layouts
+    "RUF012",  # plain class-level constant dicts, not dataclass fields
+    "TRY004",  # keep existing ValueError contracts
+]
+
+[tool.ty.src]
+# exploratory notebooks over loosely-typed JSON results
+exclude = ["dev/*.ipynb"]
+
+[tool.ty.analysis]
+# dev-only dependencies that are not installed in the default environment
+allowed-unresolved-imports = ["pytest", "pandas", "matplotlib.**", "datasets"]

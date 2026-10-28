@@ -70,7 +70,7 @@ generates a different graph. Numerics are bitwise identical in eager mode.
 """
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from nanochat.common import COMPUTE_DTYPE
 
@@ -154,7 +154,7 @@ class _Float8Matmul(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # ty: ignore[invalid-method-override] - standard autograd.Function pattern
         in_fp8, in_inv, w_fp8, w_inv = ctx.saved_tensors
 
         # === GEMM 1: grad_input = grad_output @ weight ===
@@ -179,7 +179,7 @@ class _Float8Matmul(torch.autograd.Function):
         # Transposing gives column-major, but first arg needs row-major,
         # so we must call .contiguous() to physically rearrange the memory.
         go_T = go_fp8.t().contiguous()  # [N, B] row-major
-        in_col = _to_col_major(in_fp8)    # [B, K] column-major
+        in_col = _to_col_major(in_fp8)  # [B, K] column-major
         grad_weight = torch._scaled_mm(
             go_T,
             in_col,
@@ -254,13 +254,17 @@ def convert_to_float8_training(module, *, config=None, module_filter_fn=None):
             are converted. Common use: skip layers with dims not divisible by 16
             (hardware requirement for FP8 matmuls on H100).
     """
+
     def _convert(mod, prefix=""):
         for name, child in mod.named_children():
             fqn = f"{prefix}.{name}" if prefix else name
             _convert(child, fqn)
-            if isinstance(child, nn.Linear) and not isinstance(child, Float8Linear):
-                if module_filter_fn is None or module_filter_fn(child, fqn):
-                    setattr(mod, name, Float8Linear.from_float(child))
+            if (
+                isinstance(child, nn.Linear)
+                and not isinstance(child, Float8Linear)
+                and (module_filter_fn is None or module_filter_fn(child, fqn))
+            ):
+                setattr(mod, name, Float8Linear.from_float(child))
 
     _convert(module)
     return module
