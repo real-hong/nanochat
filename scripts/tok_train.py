@@ -90,10 +90,55 @@ decoded = tokenizer.decode(encoded)
 assert decoded == test_text
 
 # -----------------------------------------------------------------------------
-# One more thing: we wish to cache a mapping from token id to number of bytes of that token
-# for efficient evaluation of bits per byte. Unlike the typical mean loss, this
-# allows us to report a loss that is invariant to the vocab size of the tokenizer.
-# The bits per byte on the validation set is then one of the primary metrics we care about.
+# Cache a lookup table of raw byte lengths for bits-per-byte (BPB) evaluation.
+#
+# Why not just compare the usual mean cross-entropy loss?
+# For target tokens y_1, ..., y_N, let p_i = P(y_i | context_i). With natural
+# logarithms, the loss at position i is l_i = -ln(p_i), measured in nats.
+# The usual mean loss is L_token = sum_i(l_i) / N, measured in nats per token.
+# However, tokenizers with different vocabularies can split the same text into
+# different numbers of tokens, so the denominator N depends on the tokenizer.
+# A longer token can also contain more information than a shorter token.
+# Therefore, a lower loss per token alone does not imply better text modeling
+# when comparing models that use different tokenizers.
+#
+# BPB instead normalizes the total negative log-likelihood by the number of raw
+# bytes represented by the evaluated targets. Define:
+#   b(v) = number of raw bytes represented by ordinary token ID v;
+#          0 for special tokens, which are excluded from this metric.
+#   S    = evaluated target positions, excluding special tokens and ignored
+#          targets (e.g. labels set to -1 by a training/evaluation mask).
+#   B    = sum_{i in S} b(y_i), the total number of evaluated bytes.
+# Then, for B > 0:
+#   total_nats = sum_{i in S} -ln(p_i)
+#   total_bits = total_nats / ln(2), since log2(p) = ln(p) / ln(2)
+#   BPB        = total_bits / B
+#              = sum_{i in S} -ln(p_i) / (ln(2) * sum_{i in S} b(y_i))
+# This is a ratio of totals, not an unweighted mean of per-token l_i / b(y_i).
+# Lower BPB means fewer idealized coding bits per byte of evaluated text.
+# For example, if 12 bytes have a total NLL of 24 * ln(2) nats, their BPB is
+# 24 / 12 = 2, whether those bytes were split into 3 tokens or 6 tokens,
+# PROVIDED the total NLL is the same. Changing tokenizers can change the total
+# NLL too: BPB gives a common unit, not a guarantee of identical scores.
+# Comparisons should use the same text and compatible evaluation conditions.
+#
+# Why save this table here?
+# Byte length is fixed once the tokenizer is trained. Save b(v) once as an
+# int32 CPU tensor of shape (vocab_size,), rather than repeatedly decoding
+# tokens during model evaluation. nanochat.loss_eval.evaluate_bpb later uses
+# token_bytes[y] to obtain target byte lengths by tensor indexing, sums the
+# lengths, and excludes zero-length special tokens from BOTH loss and bytes.
+# Ignored labels must be masked before indexing; they are not vocabulary IDs.
+# Special-token lengths are zero by evaluation convention, not because their
+# printable names contain no bytes. This convention does not itself remove
+# special tokens from the model's training objective.
+#
+# Count raw bytes, not Python characters: UTF-8 characters can occupy multiple
+# bytes, and a BPE token may contain only part of a character's byte sequence.
+# For example, "\u4f60" encodes to three bytes (E4 BD A0), but a token could contain
+# just E4. Decoding that token to text may insert a replacement character;
+# re-encoding that string would no longer recover its original byte length.
+# decode_single_token_bytes() preserves the exact bytes needed by the formula.
 vocab_size = tokenizer.get_vocab_size()
 special_ids = {tokenizer.encode_special(s) for s in tokenizer.get_special_tokens()}
 token_bytes = []
