@@ -342,8 +342,12 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
 
     Each row in the batch starts with BOS (beginning of a conversation).
     Conversations are packed using best-fit algorithm. When no conversation fits,
-    the row is padded (instead of cropping) to ensure no tokens are ever discarded.
+    the row is padded (instead of cropping the conversation that didn't fit).
     Padding positions have targets masked with -1 (ignore_index for cross-entropy).
+    Conversations longer than a whole row are truncated to the row capacity, because
+    they could never fit and would otherwise clog the buffer until all rows are padding.
+    Conversations left with no supervised targets (e.g. the first user message fills the
+    whole row) are skipped, because they would only waste rows and can make a batch all-masked.
     """
     global last_step, approx_progress, current_epoch
     assert split in {"train", "val"}, "split must be 'train' or 'val'"
@@ -351,6 +355,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     dataset_size = len(dataset)
     assert dataset_size > 0
     row_capacity = args.max_seq_len + 1  # +1 for target at last position
+    total_micro_batches = args.num_iterations * grad_accum_steps
     bos_token = tokenizer.get_bos_token_id()
 
     # Conversation buffer: list of (token_ids, loss_mask) tuples
@@ -361,11 +366,16 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     it = 0  # iteration counter
 
     def refill_buffer():
-        nonlocal cursor, epoch
+        nonlocal cursor, consumed, epoch
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
-            conv_buffer.append((ids, mask))
+            ids, mask = tokenizer.render_conversation(
+                conversation, max_tokens=row_capacity
+            )
+            if any(mask[1:]):  # mask[1:] aligns with targets
+                conv_buffer.append((ids, mask))
+            else:
+                consumed += ddp_world_size
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
@@ -404,7 +414,6 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     consumed += ddp_world_size  # Track actual consumption
                 else:
                     # No conversation fits - pad the remainder instead of cropping
-                    # This ensures we never discard any tokens
                     content_len = len(row)
                     row.extend([bos_token] * remaining)  # Pad with BOS tokens
                     mask_row.extend([0] * remaining)
@@ -419,16 +428,18 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             rows.append(row[:row_capacity])
             mask_rows.append(mask_row[:row_capacity])
 
-        # Stopping condition to respect num_iterations, if given
+        # Stopping condition to respect num_iterations, if given. num_iterations counts optimizer
+        # steps but this generator yields micro-batches, and the training loop always prefetches
+        # one extra, so the last micro-batch of the last step is fetched at it == total + 1.
         it += 1
-        if 0 < args.num_iterations <= it and split == "train":
+        if 0 < total_micro_batches < it and split == "train":
             last_step = True
 
         # Update progress tracking (based on consumed, not cursor, to account for buffering)
         if split == "train":
             current_epoch = epoch
             if args.num_iterations > 0:
-                approx_progress = it / args.num_iterations
+                approx_progress = (it - 1) / total_micro_batches
             else:
                 approx_progress = consumed / dataset_size
             # Trigger last_step when we've consumed enough (instead of when cursor wraps)
