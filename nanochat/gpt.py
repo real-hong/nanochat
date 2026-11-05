@@ -41,16 +41,98 @@ class GPTConfig:
     window_pattern: str = "SSSL"
 
 
+# https://arxiv.org/html/1910.07467v1
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))  # note that this will run in bf16, seems ok
 
-
+# nn.Linear: fully connected (dense) layer
+# -----------------------------------------
+# Applies an affine transformation to the input:
+#     y = x @ W.T + b
+#
+# Parameters:
+#   - weight: shape (out_features, in_features)
+#   - bias:   shape (out_features,), can be disabled with bias=False
+#   Both are nn.Parameter, so they are registered automatically and
+#   updated by the optimizer.
+#
+# Input/output shapes:
+#   - Input:  (*, in_features)
+#   - Output: (*, out_features)
+#   Only the last dimension is transformed; all leading dimensions are
+#   treated as batch dimensions. For example, a Transformer tensor of
+#   shape (batch, seq_len, d_model) maps to (batch, seq_len, out_features).
+#
+# Notes:
+#   - A Linear bias can usually be omitted when BatchNorm immediately follows
+#     and normalizes each output feature: batch centering cancels the bias
+#     during training, and running statistics can absorb it for inference.
+#     This does not generally apply to LayerNorm, which centers across features;
+#     a per-feature bias can still change the normalized output.
+#   - Default init: weight uses Kaiming uniform; bias is sampled from a
+#     uniform distribution whose bounds depend on in_features.
+#   - Under the hood it calls torch.nn.functional.linear, which dispatches
+#     to a BLAS GEMM (MKL/OpenBLAS on CPU, cuBLAS on GPU). The bias add is
+#     often fused into the GEMM epilogue.
+#   - A single Linear layer is purely linear, and stacking linear layers is
+#     still linear. Insert a non-linear activation (e.g. ReLU) between them.
+#   - In Transformers, the Q/K/V projections, the output projection, and
+#     both FFN layers are all nn.Linear. They hold most of the parameters
+#     and compute in large models.
+#
+#
+#
+# F.linear (torch.nn.functional.linear)
+# -------------------------------------
+# Note: the function name is lowercase `F.linear`; there is no `F.Linear`.
+#
+# F.linear is the stateless functional version of nn.Linear. It computes
+# the same affine transformation:
+#     y = x @ W.T + b
+# but it does not own any parameters. The caller must pass weight and
+# bias explicitly.
+#
+# Arguments:
+#   - input:  shape (*, in_features)
+#   - weight: shape (out_features, in_features)
+#   - bias:   shape (out_features,), optional
+#   Output:   shape (*, out_features)
+#
+# Relationship to nn.Linear:
+#   nn.Linear.forward is essentially a single line:
+#       return F.linear(input, self.weight, self.bias)
+#   The only difference is who owns the parameters:
+#     - nn.Linear: an nn.Module that creates, registers, and initializes
+#       its own weight/bias. They show up in model.parameters() and are
+#       saved/loaded via state_dict automatically.
+#     - F.linear: a plain function. Parameters are passed in by the
+#       caller and are not tracked unless you register them yourself.
+#
+# When to use F.linear:
+#   - Weight tying: e.g. reuse the embedding matrix as the output
+#     projection in a language model.
+#   - Dynamically computed weights: hypernetworks, merged LoRA weights,
+#     meta-learning (MAML), where weights are computed rather than fixed
+#     parameters.
+#   - Custom Modules: you manage parameters yourself (special init,
+#     quantization, etc.) and call F.linear inside forward().
+#
+# For ordinary network building, nn.Linear is enough. Use F.linear
+# directly only when you need non-standard handling of the weights.
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward.
     Replaces autocast: master weights stay fp32 for optimizer precision,
     but matmuls run in the activation dtype (typically bf16 from embeddings)."""
 
     def forward(self, x):  # ty: ignore[invalid-method-override] - parameter is named `input` in nn.Linear
+        # Calling layer.to(dtype=x.dtype) would change the parameters themselves.
+        # Storing the updated weights in BF16 could round away small optimizer
+        # updates; casting back to FP32 later cannot recover the lost precision.
+        # Cast only the weight Tensor used in this computation, keeping the original
+        # self.weight in FP32 (unless the model was explicitly cast elsewhere).
+        # Matmul uses x's dtype, while the differentiable Tensor.to() propagates
+        # gradients back to the original FP32 parameter for optimizer updates.
+        # If the dtype already matches, Tensor.to() returns the original Tensor.
         return F.linear(x, self.weight.to(dtype=x.dtype))
 
 
@@ -58,19 +140,102 @@ def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
 
-
+# x.shape = (B, T, H, D)
 def apply_rotary_emb(x, cos, sin):
-    # note: this rotates by -theta, the transpose of the textbook convention. Functionally
-    # equivalent (only the relative q/k rotation matters), kept for checkpoint compatibility.
+    """Apply rotary position embeddings (RoPE) to Q or K, preserving (B, T, H, D).
+
+    B is the batch size, T is the number of tokens in this call, H is the number
+    of Q or K heads, and D is the head dimension, which must be even.
+    Q and K may have different head counts (e.g. in GQA).
+    cos and sin have shape (1, T, 1, D/2); the caller slices them for the current
+    token positions. With a KV cache, these positions include the cache offset
+    rather than always starting at zero.
+
+    At position p, coordinate pair i uses angle phi_i = p * omega_i.
+    Frequencies are precomputed as omega_i = base ** (-2*i/D), with base=100000
+    by default. This function uses the supplied cosines and sines; it does not
+    compute the angles itself.
+    """
+    # Attention applies this function separately to Q and K, but not to V.
     assert x.ndim == 4  # multihead attention
+
+    # Here d is D/2, not the full head dimension.
+    # Matching entries in the two halves form 2D coordinate pairs (x_i, x_{i+d}).
+    # For D=8, the pairs are (x0,x4), (x1,x5), (x2,x6), and (x3,x7),
+    # rather than adjacent pairs (x0,x1), (x2,x3), etc.
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]  # split up last dim into two halves
+
+    # x1 and x2 are slice views of x, each with shape (B, T, H, d).
+    # cos and sin have shape (1, T, 1, d) and broadcast across B and H:
+    # all batches/heads share angles at a given position, while each coordinate
+    # pair has its own frequency. Elementwise operations implement the following
+    # matrix multiplication for each pair, written as a column vector:
+    #
+    #   [y1_i]   [ cos(phi_i)   sin(phi_i)] [x1_i]
+    #   [y2_i] = [-sin(phi_i)   cos(phi_i)] [x2_i]
+    #
+    # Comparing with the RoFormer paper (Eq. 13), using column vectors:
+    #   paper: R(a)  = [[cos(a), -sin(a)], [ sin(a), cos(a)]]
+    #   here:  R(-a) = [[cos(a),  sin(a)], [-sin(a), cos(a)]]
+    # These rotate in opposite directions. When comparing formulas, note that
+    # switching from column-vector left multiplication to row-vector right
+    # multiplication transposes the matrix for the SAME geometric rotation:
+    #   y = R(a)x  <=>  y^T = x^T R(a)^T.
+    #
+    # Why do both directions work for RoPE? For a single coordinate pair with
+    # frequency w, R(a)^T = R(-a) and R(a)R(b) = R(a+b), so:
+    #   positive: (R( m*w)q)^T (R( n*w)k) = q^T R((n-m)*w) k
+    #   negative: (R(-m*w)q)^T (R(-n*w)k) = q^T R((m-n)*w) k.
+    # Both introduce position dependence only through the relative position;
+    # the sign convention differs. Q and K must use the same convention.
+    # Opposite conventions for Q and K would instead produce a position SUM.
+    # This does not mean both directions give identical scores for fixed q/k.
+    # They are equivalent parameterizations at a fixed frequency: reflecting
+    # the second coordinate of every pair in BOTH Q and K converts one to the
+    # other, since S R(a) S = R(-a) for S = diag(1, -1). Such a reflection can
+    # be absorbed into the Q/K projection weights. The existing direction is
+    # kept for checkpoint compatibility; changing it alone changes behavior.
+    # Each pair's squared norm is preserved in exact arithmetic, subject to
+    # rounding error in floating-point computation.
     y1 = x1 * cos + x2 * sin  # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
+
+    # Concatenate the halves back to (B, T, H, D), preserving the original layout:
+    # [y1_0, ..., y1_{d-1}, y2_0, ..., y2_{d-1}].
+    # No explicit reordering into adjacent pairs or D-by-D matrix is needed.
+    #
+    # Why does this layout work even though each pair's entries are not adjacent?
+    # The pairs (x_i, x_{i+d}) define independent 2D coordinate planes covering
+    # all D coordinates. Adjacency in storage is not required for 2D rotation.
+    # Since Q and K use the same layout, their dot product can be regrouped
+    # into the sum of those 2D dot products. For D=4, write the rotated vectors as
+    #   q' = [u0, u1, v0, v1], k' = [r0, r1, s0, s1].
+    # Then
+    #   q'^T k' = u0*r0 + u1*r1 + v0*s0 + v1*s1
+    #           = (u0*r0 + v0*s0) + (u1*r1 + v1*s1).
+    # Each parenthesis is one rotated pair's dot product and therefore has the
+    # relative-position property derived above; their sum has it as well.
+    # Equivalently, applying the same coordinate permutation P to both vectors
+    # preserves the dot product: (Pq')^T(Pk') = q'^T k', since P^T P = I.
+    # This explains why the output need not interleave y1_i and y2_i.
+    # It does NOT mean that changing the input pairing with fixed Q/K weights
+    # gives the same scores: matching the paper's adjacent pairing requires a
+    # corresponding permutation of the Q/K projection output channels (and a
+    # sign change to account for the opposite rotation direction).
+    #
+    # These operations preserve the autograd graph, allowing gradients to flow
+    # through x back to the Q/K projection weights.
     return torch.cat([y1, y2], 3)
 
 
 class CausalSelfAttention(nn.Module):
+    """Shape notation: B=batch size, T=tokens in this call, C=n_embd,
+    Hq=n_head, Hkv=n_kv_head, D=head_dim, S=KV cache capacity.
+    C = Hq * D; GQA shares each KV head across Hq/Hkv query heads.
+    Tensor layouts in this class use (batch, time, heads, head_dim).
+    """
+
     def __init__(self, config, layer_idx):
         super().__init__()
         self.layer_idx = layer_idx
@@ -80,11 +245,15 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        # Linear weights use (out_features, in_features); all biases are disabled.
+        # c_q.weight: (Hq*D, C) = (C, C)
+        # c_k.weight and c_v.weight: (Hkv*D, C)
         self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)  # weight: (C, C)
         self.ve_gate_channels = 12
+        # When present, ve_gate.weight: (Hkv, 12); one gate per KV head/token.
         self.ve_gate = (
             Linear(self.ve_gate_channels, self.n_kv_head, bias=False)
             if has_ve(layer_idx, config.n_layer)
@@ -92,27 +261,42 @@ class CausalSelfAttention(nn.Module):
         )
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        # x: (B, T, C); ve: None or (B, T, Hkv*D).
+        # cos_sin: two tensors, each (1, T, 1, D/2), sliced for current positions.
+        # window_size: a pair of integer bounds, not a Tensor.
+        # kv_cache: None or a cache object; T counts only tokens in this call,
+        # including a prefill chunk or typically one token during decode.
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
+        # c_q(x): (B, T, Hq*D) -> q: (B, T, Hq, D)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        # c_k(x): (B, T, Hkv*D) -> k: (B, T, Hkv, D)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        # c_v(x): (B, T, Hkv*D) -> v: (B, T, Hkv, D)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
             assert self.ve_gate is not None  # layers that receive ve always have a gate
+            # ve: (B, T, Hkv*D) -> (B, T, Hkv, D), matching v.
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            # (B, T, n_kv_head), range (0, 3)
+            # x[..., :12]: (B, T, 12), assuming C >= 12 as required by ve_gate.
+            # ve_gate output, sigmoid, and gate: (B, T, Hkv), range (0, 3).
             gate = 3 * torch.sigmoid(self.ve_gate(x[..., : self.ve_gate_channels]))
+            # gate.unsqueeze(-1): (B, T, Hkv, 1), broadcast across D.
+            # gate * ve and the updated v: (B, T, Hkv, D).
             v = v + gate.unsqueeze(-1) * ve
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
+        cos, sin = cos_sin  # each: (1, T, 1, D/2), broadcast over B and heads
+        # RoPE preserves q: (B, T, Hq, D) and k: (B, T, Hkv, D).
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        # norm reduces over D internally; normalization preserves both shapes.
         q, k = norm(q), norm(k)  # QK norm
         # sharper attention (split scale between Q and K), TODO think through better
+        # Scalar scaling preserves q/k shapes.
         q = q * 1.2
         k = k * 1.2
 
@@ -120,12 +304,21 @@ class CausalSelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
+            # Logical attention scores/weights: (B, Hq, T, T), with KV heads
+            # shared under GQA. Flash Attention need not materialize this tensor.
+            # Output y: (B, T, Hq, D), using the QUERY head count.
             y = flash_attn.flash_attn_func(
                 q, k, v, causal=True, window_size=window_size
             )
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            # Each layer cache: (B, S, Hkv, D); S is allocated capacity.
+            # cache_seqlens: (B,) int32, containing each sequence's cached length.
+            # New k/v: (B, T, Hkv, D), written into the cache in place.
+            # For a uniform previous length P, attention uses P+T keys/values:
+            # logical scores/weights are (B, Hq, T, P+T), subject to masking.
+            # Output y: (B, T, Hq, D), containing only this call's query outputs.
             y = flash_attn.flash_attn_with_kvcache(
                 q,
                 k_cache,
@@ -138,10 +331,14 @@ class CausalSelfAttention(nn.Module):
             )
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
+                # Add scalar T to cache_seqlens; its shape remains (B,).
                 kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
+        # contiguous(): same (B, T, Hq, D) shape, with contiguous storage.
+        # view merges Hq and D: (B, T, Hq*D) = (B, T, C).
         y = y.contiguous().view(B, T, -1)
+        # c_proj: (B, T, C) -> (B, T, C), matching the residual stream.
         y = self.c_proj(y)
         return y
 
